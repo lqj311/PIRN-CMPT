@@ -4,11 +4,11 @@ set -euo pipefail
 # Final thesis experiment plan:
 #   Exp-0 Main: Full Model, K=16, full modality
 #   Exp-1 K-shot: K=1,2,4,8,16, full modality
-#   Exp-2 Cross-modal missing: RGB-only/SN-only/full modality with and without CMPT
-#   Exp-3 Shared prototype: no prototype/specific only/shared only/specific+shared
+#   Exp-2 Missing modality: RGB-only/SN-only with and without CMPT
+#   Exp-3 Module ablation: baseline + leave-one-out APR/CMPT/SPA/MNC table
 #
 # Unique configs:
-#   K-shot full-model gives K=16 main result, so total unique configs = 15.
+#   K-shot full-model gives K=16 main/full-module result, so total executed configs = 14 per seed.
 #
 # Usage:
 #   cd /root/autodl-tmp/PIRN-CMPT/CMDIAD-main
@@ -82,7 +82,8 @@ for SEED in $SEEDS; do
     --allow_true_missing_modality \
     --few_shot_k 16 \
     --shot_seed "$SEED" \
-    --disable_cmpt
+    --disable_cmpt \
+    --paper_mnc
 
   run_exp "final_k16_seed${SEED}_sn_missing_rgb_full" \
     --main_modality sn \
@@ -96,36 +97,50 @@ for SEED in $SEEDS; do
     --allow_true_missing_modality \
     --few_shot_k 16 \
     --shot_seed "$SEED" \
-    --disable_cmpt
-
-  run_exp "final_k16_seed${SEED}_full_modality_no_cmpt" \
-    --main_modality '' \
-    --few_shot_k 16 \
-    --shot_seed "$SEED" \
-    --disable_cmpt
-
-  # Full modality full model is reused from final_k16_seed*_full_model.
-
-  # Exp-3 shared prototype at K=16.
-  run_exp "final_k16_seed${SEED}_proto_none" \
-    --main_modality '' \
-    --few_shot_k 16 \
-    --shot_seed "$SEED" \
-    --disable_prototypes
-
-  run_exp "final_k16_seed${SEED}_proto_specific_only" \
-    --main_modality '' \
-    --few_shot_k 16 \
-    --shot_seed "$SEED" \
-    --disable_shared_proto \
+    --disable_cmpt \
     --paper_mnc
 
-  run_exp "final_k16_seed${SEED}_proto_shared_only" \
+  # Full-modality Full Model is reused from final_k16_seed*_full_model.
+
+  # Exp-3 module ablation at K=16, following PIRN's baseline + leave-one-out style.
+  # Full model reuses final_k16_seed*_full_model.
+  run_exp "final_k16_seed${SEED}_module_base" \
     --main_modality '' \
     --few_shot_k 16 \
     --shot_seed "$SEED" \
-    --only_shared_proto \
+    --disable_apr \
+    --disable_cmpt \
+    --disable_spa \
+    --disable_mnc \
     --paper_mnc
 
-  # Specific + shared is reused from final_k16_seed*_full_model.
+  run_exp "final_k16_seed${SEED}_module_wo_apr" \
+    --main_modality '' \
+    --few_shot_k 16 \
+    --shot_seed "$SEED" \
+    --disable_apr \
+    --paper_mnc
+
+  run_exp "final_k16_seed${SEED}_module_wo_cmpt" \
+    --main_modality '' \
+    --few_shot_k 16 \
+    --shot_seed "$SEED" \
+    --disable_cmpt \
+    --paper_mnc
+
+  run_exp "final_k16_seed${SEED}_module_wo_spa" \
+    --main_modality '' \
+    --few_shot_k 16 \
+    --shot_seed "$SEED" \
+    --disable_spa \
+    --paper_mnc
+
+  run_exp "final_k16_seed${SEED}_module_wo_mnc" \
+    --main_modality '' \
+    --few_shot_k 16 \
+    --shot_seed "$SEED" \
+    --disable_mnc \
+    --paper_mnc
+
+  # Full APR + CMPT + SPA + MNC is reused from final_k16_seed*_full_model.
 done

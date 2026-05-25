@@ -51,6 +51,27 @@ map = map_real + gate * map_pseudo
 - `--cmpt_aux_weight`，默认 `0.25`
 - `--cmpt_aux_confidence_threshold`，默认 `0.55`
 
+3. CMPT 增加 cycle consistency 辅助异常图。
+
+缺 SN 时不再主要依赖 pseudo SN 自身的误差图，而是：
+
+```text
+RGB -> pseudo SN -> cycle RGB
+```
+
+然后用真实 RGB token 与 cycle RGB token 的残差作为 CMPT 辅助异常图。缺 RGB 时同理：
+
+```text
+SN -> pseudo RGB -> cycle SN
+```
+
+这样 CMPT 的异常响应回到可用模态空间，避免伪模态分布偏移直接污染最终 heatmap。
+
+新增参数：
+
+- `--cmpt_aux_mode`，默认 `cycle`，可选 `pseudo_error`、`cycle`、`both`
+- `--cmpt_gate_max_tokens`，默认 `20000`
+
 ## 预期影响
 
 - 当 CMPT 生成质量较好时，伪模态分支提供补充异常线索。

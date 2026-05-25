@@ -324,6 +324,7 @@ class CMPTFeatures(Features):
         self.pseudo_sn_prototypes = None
         self.pseudo_rgb_prototypes = None
         self.prototype_ready = False
+        self._cmpt_reliability_cache = {}
 
         self.patch_rgb56_train = []
         self.patch_sn56_train = []
@@ -556,14 +557,46 @@ class CMPTFeatures(Features):
             save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({'mnc': self.learnable_mnc.state_dict()}, save_path)
 
+    def _spa_assign_and_reconstruct(self, tokens, prototypes, temperature=None):
+        temperature = self.args.spa_temperature if temperature is None else temperature
+        tokens = F.normalize(tokens, dim=-1)
+        prototypes = F.normalize(prototypes, dim=-1)
+        if getattr(self.args, 'disable_spa', False):
+            sim = tokens @ prototypes.t()
+            indices = sim.argmax(dim=-1, keepdim=True)
+            assignment = torch.zeros_like(sim)
+            assignment.scatter_(dim=-1, index=indices, value=1.0)
+            return prototypes[indices.squeeze(-1)], assignment
+        mode = getattr(self.args, 'spa_assignment', 'structured_ot')
+        if mode == 'structured_ot':
+            return structured_prototype_assignment(
+                tokens,
+                prototypes,
+                temperature=temperature,
+                sinkhorn_iters=self.args.spa_sinkhorn_iters,
+            )
+        if mode == 'softmax':
+            assignment = torch.softmax((tokens @ prototypes.t()) / temperature, dim=-1)
+            return assignment @ prototypes, assignment
+        if mode == 'topk':
+            k = min(max(1, self.args.spa_topk), prototypes.shape[0])
+            sim = tokens @ prototypes.t()
+            values, indices = torch.topk(sim, k=k, dim=-1)
+            weights = torch.softmax(values / temperature, dim=-1)
+            assignment = torch.zeros_like(sim)
+            assignment.scatter_(dim=-1, index=indices, src=weights)
+            return assignment @ prototypes, assignment
+        if mode == 'nearest':
+            sim = tokens @ prototypes.t()
+            indices = sim.argmax(dim=-1, keepdim=True)
+            assignment = torch.zeros_like(sim)
+            assignment.scatter_(dim=-1, index=indices, value=1.0)
+            return prototypes[indices.squeeze(-1)], assignment
+        raise ValueError(f'Unsupported SPA assignment mode: {mode}')
+
     def _spa_reconstruction_tensor(self, tokens, modal):
         prototypes = self._prototype_bank(modal)
-        reconstruction, _ = structured_prototype_assignment(
-            tokens,
-            prototypes,
-            temperature=self.args.spa_temperature,
-            sinkhorn_iters=self.args.spa_sinkhorn_iters,
-        )
+        reconstruction, _ = self._spa_assign_and_reconstruct(tokens, prototypes)
         return reconstruction
 
     def _cross_memory_tensor(self, cross_modal):
@@ -709,7 +742,7 @@ class CMPTFeatures(Features):
             return prototypes
         train_tokens = sample_tokens(tokens, max_tokens=self.args.prototype_max_tokens)
         if self.args.apr_memory_update_iters > 0:
-            return adaptive_prototype_memory_update(
+            refined = adaptive_prototype_memory_update(
                 train_tokens,
                 prototypes,
                 temperature=self.args.spa_temperature,
@@ -718,19 +751,46 @@ class CMPTFeatures(Features):
                 confidence_threshold=self.args.apr_confidence_threshold,
                 update_iters=self.args.apr_memory_update_iters,
             )
+            return self._safe_refined_prototypes(train_tokens, prototypes, refined)
         _, assignment = structured_prototype_assignment(
             train_tokens,
             prototypes,
             temperature=self.args.spa_temperature,
             sinkhorn_iters=self.args.spa_sinkhorn_iters,
         )
-        return adaptive_prototype_refinement(
+        refined = adaptive_prototype_refinement(
             train_tokens,
             prototypes,
             assignment,
             update_rate=self.args.apr_update_rate,
             confidence_threshold=self.args.apr_confidence_threshold,
         )
+        return self._safe_refined_prototypes(train_tokens, prototypes, refined)
+
+    def _safe_refined_prototypes(self, tokens, prototypes, refined_prototypes):
+        with torch.no_grad():
+            tokens = F.normalize(tokens, dim=-1)
+            prototypes = F.normalize(prototypes, dim=-1)
+            refined_prototypes = F.normalize(refined_prototypes, dim=-1)
+            base_reconstruction, _ = structured_prototype_assignment(
+                tokens,
+                prototypes,
+                temperature=self.args.spa_temperature,
+                sinkhorn_iters=self.args.spa_sinkhorn_iters,
+            )
+            refined_reconstruction, _ = structured_prototype_assignment(
+                tokens,
+                refined_prototypes,
+                temperature=self.args.spa_temperature,
+                sinkhorn_iters=self.args.spa_sinkhorn_iters,
+            )
+            base_error = torch.linalg.norm(tokens - F.normalize(base_reconstruction, dim=-1), dim=-1).mean()
+            refined_error = torch.linalg.norm(tokens - F.normalize(refined_reconstruction, dim=-1), dim=-1).mean()
+        if refined_error.item() <= base_error.item() + 1e-6:
+            return refined_prototypes
+        drift = torch.clamp((refined_error - base_error) / (base_error + 1e-8), min=0.0)
+        fallback_gate = torch.clamp(self.args.apr_update_rate * torch.exp(-8.0 * drift), 0.0, self.args.apr_update_rate)
+        return F.normalize((1.0 - fallback_gate) * prototypes + fallback_gate * refined_prototypes, dim=-1)
 
     def _transfer_prototypes(self, source_prototypes, target_prototypes, out_type):
         if getattr(self.args, 'disable_cmpt', False) or getattr(self.args, 'disable_pseudo_proto', False):
@@ -820,12 +880,7 @@ class CMPTFeatures(Features):
     def _mix_shared_reconstruction(self, tokens, reconstruction):
         if self.shared_prototypes is None or getattr(self.args, 'disable_shared_proto', False):
             return reconstruction
-        shared_reconstruction, shared_assignment = structured_prototype_assignment(
-            tokens,
-            self.shared_prototypes,
-            temperature=self.args.spa_temperature,
-            sinkhorn_iters=self.args.spa_sinkhorn_iters,
-        )
+        shared_reconstruction, shared_assignment = self._spa_assign_and_reconstruct(tokens, self.shared_prototypes)
         shared_confidence = shared_assignment.max(dim=-1, keepdim=True).values
         consistency = (F.normalize(tokens, dim=-1) * F.normalize(shared_reconstruction, dim=-1)).sum(dim=-1, keepdim=True)
         gate = torch.sigmoid(
@@ -834,12 +889,173 @@ class CMPTFeatures(Features):
         gate = torch.clamp(gate * self.args.shared_proto_gate, 0.0, self.args.shared_proto_gate)
         return F.normalize((1.0 - gate) * reconstruction + gate * shared_reconstruction, dim=-1)
 
+    def _cmpt_normality_communication(self, tokens, reconstruction, modal, cross_modal):
+        if getattr(self.args, 'disable_cmpt', False):
+            return reconstruction
+        if cross_modal is None:
+            return reconstruction
+
+        with torch.no_grad():
+            if modal == 'rgb':
+                pseudo_cross = self.cmpt(rgb_feature=reconstruction.unsqueeze(0), out_type='sn').squeeze(0)
+            elif modal == 'sn':
+                pseudo_cross = self.cmpt(sn_feature=reconstruction.unsqueeze(0), out_type='rgb').squeeze(0)
+            elif modal == 'pseudo_sn':
+                pseudo_cross = self.cmpt(sn_feature=reconstruction.unsqueeze(0), out_type='rgb').squeeze(0)
+            elif modal == 'pseudo_rgb':
+                pseudo_cross = self.cmpt(rgb_feature=reconstruction.unsqueeze(0), out_type='sn').squeeze(0)
+            else:
+                raise ValueError(f'Unsupported CMPT-NC modal: {modal}')
+
+            cross_reconstruction, cross_assignment = self._spa_assign_and_reconstruct(
+                pseudo_cross,
+                self._specific_prototype_bank(cross_modal),
+                temperature=self.args.mnc_temperature,
+            )
+
+            if modal in {'rgb', 'pseudo_rgb'}:
+                aligned = self.cmpt(sn_feature=cross_reconstruction.unsqueeze(0), out_type='rgb').squeeze(0)
+            elif modal in {'sn', 'pseudo_sn'}:
+                aligned = self.cmpt(rgb_feature=cross_reconstruction.unsqueeze(0), out_type='sn').squeeze(0)
+            else:
+                raise ValueError(f'Unsupported CMPT-NC modal: {modal}')
+
+        tokens = F.normalize(tokens, dim=-1)
+        reconstruction = F.normalize(reconstruction, dim=-1)
+        aligned = F.normalize(aligned, dim=-1)
+
+        confidence = cross_assignment.max(dim=-1, keepdim=True).values
+        token_consistency = (tokens * aligned).sum(dim=-1, keepdim=True)
+        recon_consistency = (reconstruction * aligned).sum(dim=-1, keepdim=True)
+
+        own_prototypes = F.normalize(self._prototype_bank(modal), dim=-1)
+        base_normality = (reconstruction @ own_prototypes.t()).max(dim=-1, keepdim=True).values
+        aligned_normality = (aligned @ own_prototypes.t()).max(dim=-1, keepdim=True).values
+        normality_gain = aligned_normality - base_normality
+        safe_mask = (normality_gain >= -self.args.cmpt_nc_safe_margin).to(tokens.dtype)
+
+        confidence_gate = torch.sigmoid((confidence - self.args.cmpt_nc_confidence_threshold) * 8.0)
+        token_gate = torch.sigmoid((token_consistency - self.args.cmpt_nc_confidence_threshold) * 4.0)
+        recon_gate = torch.sigmoid((recon_consistency - self.args.cmpt_nc_confidence_threshold) * 8.0)
+        normality_gate = torch.sigmoid(normality_gain * 12.0)
+        gate = confidence_gate * token_gate * recon_gate * normality_gate * safe_mask
+        gate = torch.clamp(gate * self.args.cmpt_nc_weight, 0.0, self.args.cmpt_nc_weight)
+        return F.normalize(reconstruction + gate * (aligned - reconstruction), dim=-1)
+
+    def _mnc_stage2_only(self, tokens, reconstruction, modal):
+        own_prototypes = F.normalize(self._prototype_bank(modal), dim=-1)
+        own_context, own_attention = self._prototype_attention(reconstruction, own_prototypes, self.args.mnc_temperature)
+        own_confidence = own_attention.max(dim=-1, keepdim=True).values
+        token_consistency = torch.sigmoid((F.normalize(tokens, dim=-1) * F.normalize(reconstruction, dim=-1)).sum(dim=-1, keepdim=True))
+        gate = torch.clamp((own_confidence + token_consistency) * 0.5 * self.args.mnc_stage2_weight, 0.0, self.args.mnc_stage2_weight)
+        return F.normalize((1.0 - gate) * reconstruction + gate * own_context, dim=-1)
+
+    @staticmethod
+    def _prototype_attention(query, prototypes, temperature=0.05):
+        query = F.normalize(query, dim=-1)
+        prototypes = F.normalize(prototypes, dim=-1)
+        attention = torch.softmax((query @ prototypes.t()) / temperature, dim=-1)
+        return attention @ prototypes, attention
+
     def _cmpt_auxiliary_gate(self, real_patch, pseudo_patch):
         real = F.normalize(real_patch.to(self.device), dim=-1)
         pseudo = F.normalize(pseudo_patch.to(self.device), dim=-1)
         consistency = (real * pseudo).sum(dim=-1).mean()
         gate = torch.sigmoid((consistency - self.args.cmpt_aux_confidence_threshold) * 8.0)
         return torch.clamp(gate * self.args.cmpt_aux_weight, 0.0, self.args.cmpt_aux_weight).cpu()
+
+    def _cmpt_cycle_patch(self, patch, out_type):
+        with torch.no_grad():
+            if out_type == 'rgb':
+                return self.cmpt(sn_feature=patch.unsqueeze(0).to(self.device), out_type='rgb').squeeze(0).cpu()
+            if out_type == 'sn':
+                return self.cmpt(rgb_feature=patch.unsqueeze(0).to(self.device), out_type='sn').squeeze(0).cpu()
+        raise ValueError(f'Unsupported CMPT cycle target: {out_type}')
+
+    def _cmpt_reliability_gate(self, modal):
+        if modal in self._cmpt_reliability_cache:
+            return self._cmpt_reliability_cache[modal]
+        rgb_train, sn_train = self._paired_train_tokens(getattr(self.args, 'cmpt_gate_max_tokens', 20000))
+        rgb_train = rgb_train.to(self.device)
+        sn_train = sn_train.to(self.device)
+        with torch.no_grad():
+            if modal == 'rgb':
+                pseudo_sn = self.cmpt(rgb_feature=rgb_train.unsqueeze(0), out_type='sn').squeeze(0)
+                cycle_rgb = self.cmpt(sn_feature=pseudo_sn.unsqueeze(0), out_type='rgb').squeeze(0)
+                error = torch.linalg.norm(F.normalize(rgb_train, dim=-1) - F.normalize(cycle_rgb, dim=-1), dim=-1).mean()
+            elif modal == 'sn':
+                pseudo_rgb = self.cmpt(sn_feature=sn_train.unsqueeze(0), out_type='rgb').squeeze(0)
+                cycle_sn = self.cmpt(rgb_feature=pseudo_rgb.unsqueeze(0), out_type='sn').squeeze(0)
+                error = torch.linalg.norm(F.normalize(sn_train, dim=-1) - F.normalize(cycle_sn, dim=-1), dim=-1).mean()
+            else:
+                raise ValueError(f'Unsupported CMPT reliability modal: {modal}')
+        gate = torch.sigmoid((self.args.cmpt_aux_confidence_threshold - error) * 8.0)
+        gate = torch.clamp(gate * self.args.cmpt_aux_weight, 0.0, self.args.cmpt_aux_weight).cpu()
+        self._cmpt_reliability_cache[modal] = gate
+        return gate
+
+    def _cycle_error_map(self, real_patch, cycle_patch):
+        s_map = reconstruction_error_map(
+            real_patch.to(self.device),
+            cycle_patch.to(self.device),
+            out_size=self.gt_size,
+            feature_hw=self._feature_hw(real_patch),
+        ).cpu()
+        return self.blur(s_map)
+
+    def _cmpt_full_consistency_map(self, rgb_patch, sn_patch, sample):
+        if getattr(self.args, 'disable_cmpt', False) or getattr(self.args, 'disable_pseudo_proto', False):
+            return None, torch.tensor(0.0)
+        rgb_gate = self._cmpt_reliability_gate('rgb')
+        sn_gate = self._cmpt_reliability_gate('sn')
+        gate = torch.minimum(rgb_gate, sn_gate) * self.args.cmpt_full_consistency_weight
+        if float(gate) <= 1e-8:
+            return None, gate
+        pseudo_sn = self._pseudo_sn_from_rgb(rgb_patch)
+        pseudo_rgb = self._pseudo_rgb_from_sn(sn_patch)
+        rgb_to_sn_map = reconstruction_error_map(
+            sn_patch.to(self.device),
+            pseudo_sn.to(self.device),
+            out_size=self.gt_size,
+            feature_hw=self._feature_hw(sn_patch),
+        ).cpu()
+        sn_to_rgb_map = reconstruction_error_map(
+            rgb_patch.to(self.device),
+            pseudo_rgb.to(self.device),
+            out_size=self.gt_size,
+            feature_hw=self._feature_hw(rgb_patch),
+        ).cpu()
+        rgb_to_sn_map = self._mask_sn_error_map(self.blur(rgb_to_sn_map), sample)
+        sn_to_rgb_map = self.blur(sn_to_rgb_map)
+        cmpt_map = 0.5 * (rgb_to_sn_map + sn_to_rgb_map)
+        return cmpt_map, gate
+
+    @staticmethod
+    def _normalize_score_tensor(s_map):
+        score = s_map.detach()
+        min_value = score.amin(dim=(-2, -1), keepdim=True)
+        max_value = score.amax(dim=(-2, -1), keepdim=True)
+        return (score - min_value) / (max_value - min_value + 1e-8)
+
+    def _fuse_real_and_cmpt_maps(self, real_map, cmpt_map, gate):
+        if self.args.cmpt_fusion_mode == 'add':
+            return real_map + gate * cmpt_map
+        if self.args.cmpt_fusion_mode == 'max':
+            return torch.maximum(real_map, gate * cmpt_map)
+        real_focus = self._normalize_score_tensor(real_map).pow(self.args.cmpt_consensus_power)
+        return real_map + gate * real_focus * cmpt_map
+
+    def _fuse_branch_maps(self, rgb_map, sn_map):
+        if self.args.branch_fusion_mode == 'sum':
+            return rgb_map + sn_map
+        if self.args.branch_fusion_mode == 'mean':
+            return 0.5 * (rgb_map + sn_map)
+        if self.args.branch_fusion_mode == 'max':
+            return torch.maximum(rgb_map, sn_map)
+        rgb_norm = self._normalize_score_tensor(rgb_map)
+        sn_norm = self._normalize_score_tensor(sn_map)
+        consensus = torch.minimum(rgb_norm, sn_norm) * torch.maximum(rgb_map, sn_map)
+        return 0.5 * (rgb_map + sn_map) + self.args.branch_consensus_weight * consensus
 
     def _reconstruct_with_prototypes(self, patch, modal, cross_modal=None):
         tokens = patch.to(self.device)
@@ -858,21 +1074,13 @@ class CMPTFeatures(Features):
             return self._score_from_map(s_map), s_map
 
         prototypes = self._prototype_bank(modal)
-        reconstruction, _ = structured_prototype_assignment(
-            tokens,
-            prototypes,
-            temperature=self.args.spa_temperature,
-            sinkhorn_iters=self.args.spa_sinkhorn_iters,
-        )
+        reconstruction, _ = self._spa_assign_and_reconstruct(tokens, prototypes)
         reconstruction = self._mix_shared_reconstruction(tokens, reconstruction)
+        pre_mnc_reconstruction = reconstruction
+        mnc_applied = False
 
         if self.args.apr_inference_refine:
-            _, assignment = structured_prototype_assignment(
-                tokens,
-                prototypes,
-                temperature=self.args.spa_temperature,
-                sinkhorn_iters=self.args.spa_sinkhorn_iters,
-            )
+            _, assignment = self._spa_assign_and_reconstruct(tokens, prototypes)
             refined_prototypes = adaptive_prototype_refinement(
                 tokens,
                 prototypes,
@@ -880,18 +1088,34 @@ class CMPTFeatures(Features):
                 update_rate=self.args.apr_update_rate,
                 confidence_threshold=self.args.apr_confidence_threshold,
             )
-            reconstruction, _ = structured_prototype_assignment(
-                tokens,
-                refined_prototypes,
-                temperature=self.args.spa_temperature,
-                sinkhorn_iters=self.args.spa_sinkhorn_iters,
-            )
+            reconstruction, _ = self._spa_assign_and_reconstruct(tokens, refined_prototypes)
             reconstruction = self._mix_shared_reconstruction(tokens, reconstruction)
 
-        if getattr(self.args, 'disable_mnc', False):
-            cross_modal = None
+        use_cmpt_nc = (
+            cross_modal is not None
+            and getattr(self.args, 'cmpt_replace_mnc1', False)
+            and not getattr(self.args, 'disable_cmpt', False)
+        )
+        use_mnc_stage2 = (
+            cross_modal is not None
+            and self.args.mnc_strong
+            and not getattr(self.args, 'disable_mnc', False)
+        )
 
-        if cross_modal is not None:
+        if use_cmpt_nc:
+            reconstruction = self._cmpt_normality_communication(
+                tokens,
+                reconstruction,
+                modal,
+                cross_modal,
+            )
+
+        if use_mnc_stage2 and getattr(self.args, 'cmpt_replace_mnc1', False):
+            reconstruction = self._mnc_stage2_only(tokens, reconstruction, modal)
+            mnc_applied = True
+            for _ in range(max(0, self.args.mnc_stages - 2)):
+                reconstruction = self._mnc_stage2_only(tokens, reconstruction, modal)
+        elif cross_modal is not None and not getattr(self.args, 'disable_mnc', False) and not use_cmpt_nc:
             if self.use_learnable_mnc:
                 if not self.mnc_trained:
                     raise RuntimeError('Learnable MNC is enabled but not trained or loaded.')
@@ -935,15 +1159,26 @@ class CMPTFeatures(Features):
                         cross_prototypes,
                         weight=self.args.mnc_cross_weight,
                     )
+                mnc_applied = True
 
         s_map = reconstruction_error_map(
             tokens,
-            reconstruction,
+            pre_mnc_reconstruction if mnc_applied else reconstruction,
             out_size=self.gt_size,
             feature_hw=self._feature_hw(patch),
         ).cpu()
         s_map = self.blur(s_map)
-        return self._score_from_map(s_map), s_map
+        score_map = s_map
+        if mnc_applied:
+            post_mnc_map = reconstruction_error_map(
+                tokens,
+                reconstruction,
+                out_size=self.gt_size,
+                feature_hw=self._feature_hw(patch),
+            ).cpu()
+            post_mnc_map = self.blur(post_mnc_map)
+            s_map = torch.maximum(s_map, post_mnc_map)
+        return self._score_from_map(score_map), s_map
 
     def _scores_from_sample(self, sample):
         if self.args.main_modality == 'rgb':
@@ -954,12 +1189,24 @@ class CMPTFeatures(Features):
             pseudo_sn_patch = self._pseudo_sn_from_rgb(rgb_patch56)
             s_rgb, smap_rgb = self._reconstruct_with_prototypes(rgb_patch56, 'rgb', cross_modal='pseudo_sn')
             s_sn, smap_sn = self._reconstruct_with_prototypes(pseudo_sn_patch, 'pseudo_sn', cross_modal='rgb')
-            cmpt_gate = self._cmpt_auxiliary_gate(rgb_patch56, pseudo_sn_patch)
-            s = self.args.rgb_s_lambda * s_rgb + cmpt_gate * self.args.cmpt_s_lambda * s_sn
-            s_map = self.args.rgb_smap_lambda * smap_rgb + cmpt_gate * self.args.cmpt_smap_lambda * smap_sn
+            cmpt_gate = self._cmpt_reliability_gate('rgb')
+            if self.args.cmpt_aux_mode == 'pseudo_error':
+                cmpt_map = smap_sn
+            else:
+                cycle_rgb_patch = self._cmpt_cycle_patch(pseudo_sn_patch, out_type='rgb')
+                cycle_map = self._cycle_error_map(rgb_patch56, cycle_rgb_patch)
+                cmpt_map = cycle_map if self.args.cmpt_aux_mode == 'cycle' else 0.5 * (cycle_map + smap_sn)
+            s_cmpt = self._score_from_map(cmpt_map)
+            s = self.args.rgb_s_lambda * s_rgb + cmpt_gate * self.args.cmpt_s_lambda * s_cmpt
+            s_map = self._fuse_real_and_cmpt_maps(
+                self.args.rgb_smap_lambda * smap_rgb,
+                self.args.cmpt_smap_lambda * cmpt_map,
+                cmpt_gate,
+            )
             component_maps = {
                 'rgb_error': smap_rgb,
                 'pseudo_sn_error': smap_sn,
+                'cmpt_aux_error': cmpt_map,
                 'fused': s_map,
             }
             return s, s_map, component_maps
@@ -977,12 +1224,25 @@ class CMPTFeatures(Features):
             smap_rgb = self._mask_sn_error_map(smap_rgb, sample)
             s_sn = self._score_from_map(smap_sn)
             s_rgb = self._score_from_map(smap_rgb)
-            cmpt_gate = self._cmpt_auxiliary_gate(sn_patch56, pseudo_rgb_patch)
-            s = self.args.sn_s_lambda * s_sn + cmpt_gate * self.args.cmpt_s_lambda * s_rgb
-            s_map = self.args.sn_smap_lambda * smap_sn + cmpt_gate * self.args.cmpt_smap_lambda * smap_rgb
+            cmpt_gate = self._cmpt_reliability_gate('sn')
+            if self.args.cmpt_aux_mode == 'pseudo_error':
+                cmpt_map = smap_rgb
+            else:
+                cycle_sn_patch = self._cmpt_cycle_patch(pseudo_rgb_patch, out_type='sn')
+                cycle_map = self._cycle_error_map(sn_patch56, cycle_sn_patch)
+                cycle_map = self._mask_sn_error_map(cycle_map, sample)
+                cmpt_map = cycle_map if self.args.cmpt_aux_mode == 'cycle' else 0.5 * (cycle_map + smap_rgb)
+            s_cmpt = self._score_from_map(cmpt_map)
+            s = self.args.sn_s_lambda * s_sn + cmpt_gate * self.args.cmpt_s_lambda * s_cmpt
+            s_map = self._fuse_real_and_cmpt_maps(
+                self.args.sn_smap_lambda * smap_sn,
+                self.args.cmpt_smap_lambda * cmpt_map,
+                cmpt_gate,
+            )
             component_maps = {
                 'sn_error': smap_sn,
                 'pseudo_rgb_error': smap_rgb,
+                'cmpt_aux_error': cmpt_map,
                 'fused': s_map,
             }
             return s, s_map, component_maps
@@ -996,15 +1256,21 @@ class CMPTFeatures(Features):
                 self.args.rgb_s_lambda * s_rgb
                 + self.args.sn_s_lambda * s_sn
             )
-            s_map = (
-                self.args.rgb_smap_lambda * smap_rgb
-                + self.args.sn_smap_lambda * smap_sn
+            s_map = self._fuse_branch_maps(
+                self.args.rgb_smap_lambda * smap_rgb,
+                self.args.sn_smap_lambda * smap_sn,
             )
+            cmpt_map, cmpt_gate = self._cmpt_full_consistency_map(rgb_patch56, sn_patch56, sample)
+            if cmpt_map is not None:
+                s_map = self._fuse_real_and_cmpt_maps(s_map, cmpt_map, cmpt_gate)
+            s = self._score_from_map(s_map)
             component_maps = {
                 'rgb_error': smap_rgb,
                 'sn_error': smap_sn,
                 'fused': s_map,
             }
+            if cmpt_map is not None:
+                component_maps['cmpt_full_consistency'] = cmpt_map
         return s, s_map, component_maps
 
     def add_sample_to_late_fusion_mem_bank(self, sample):

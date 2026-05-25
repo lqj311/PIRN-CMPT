@@ -170,6 +170,13 @@ if __name__ == '__main__':
     parser.add_argument('--num_shared_prototypes', default=64, type=int)
     parser.add_argument('--prototype_kmeans_iters', default=20, type=int)
     parser.add_argument('--prototype_max_tokens', default=200000, type=int)
+    parser.add_argument('--spa_assignment', default='structured_ot', type=str,
+                        choices=['structured_ot', 'softmax', 'topk', 'nearest'],
+                        help='Prototype assignment used by SPA reconstruction.')
+    parser.add_argument('--spa_topk', default=5, type=int,
+                        help='Top-k prototypes used when --spa_assignment topk.')
+    parser.add_argument('--disable_spa', default=False, action='store_true',
+                        help='Ablation: replace SPA structured assignment with nearest prototype reconstruction.')
     parser.add_argument('--spa_temperature', default=0.05, type=float)
     parser.add_argument('--spa_sinkhorn_iters', default=5, type=int)
     parser.add_argument('--apr_update_rate', default=0.15, type=float)
@@ -187,6 +194,30 @@ if __name__ == '__main__':
                         help='Maximum auxiliary contribution of CMPT pseudo-modality maps in missing-modality scoring.')
     parser.add_argument('--cmpt_aux_confidence_threshold', default=0.55, type=float,
                         help='Pseudo-modality reliability threshold for CMPT auxiliary scoring.')
+    parser.add_argument('--cmpt_aux_mode', default='cycle', type=str, choices=['pseudo_error', 'cycle', 'both'],
+                        help='How CMPT contributes under missing modality.')
+    parser.add_argument('--cmpt_gate_max_tokens', default=20000, type=int,
+                        help='Maximum normal training tokens used to estimate CMPT auxiliary reliability.')
+    parser.add_argument('--cmpt_fusion_mode', default='consensus', type=str, choices=['add', 'consensus', 'max'],
+                        help='How real and CMPT auxiliary error maps are fused under missing modality.')
+    parser.add_argument('--cmpt_consensus_power', default=1.5, type=float,
+                        help='Power applied to normalized real-modality map for consensus CMPT fusion.')
+    parser.add_argument('--cmpt_full_consistency_weight', default=0.15, type=float,
+                        help='Maximum contribution of RGB<->SN CMPT consistency maps when both modalities are available.')
+    parser.add_argument('--cmpt_replace_mnc1', default=False, action='store_true',
+                        help='Use CMPT as the first-stage cross-modal normality communication block.')
+    parser.add_argument('--classic_pirn_mnc1', default=False, action='store_true',
+                        help='Keep the previous PIRN-style MNC stage1 when --paper_mnc is used.')
+    parser.add_argument('--cmpt_nc_weight', default=0.1, type=float,
+                        help='Maximum gate weight of CMPT normality communication when replacing MNC stage1.')
+    parser.add_argument('--cmpt_nc_confidence_threshold', default=0.6, type=float,
+                        help='Confidence threshold for CMPT normality communication.')
+    parser.add_argument('--cmpt_nc_safe_margin', default=0.0, type=float,
+                        help='Allow CMPT-NC candidate reconstruction only when normal-prototype compatibility does not decrease beyond this margin.')
+    parser.add_argument('--branch_fusion_mode', default='consensus', type=str, choices=['sum', 'mean', 'consensus', 'max'],
+                        help='Fusion strategy for RGB and SN maps when both modalities are available.')
+    parser.add_argument('--branch_consensus_weight', default=0.25, type=float,
+                        help='Weight of RGB/SN consensus term when branch_fusion_mode=consensus.')
     parser.add_argument('--mnc_cross_weight', default=0.5, type=float)
     parser.add_argument('--mnc_stages', default=2, type=int)
     parser.add_argument('--mnc_strong', default=False, action='store_true')
@@ -353,9 +384,15 @@ if __name__ == '__main__':
                         help='Root directory for saved heatmap visualizations.')
 
     args = parser.parse_args()
+    if args.paper_mnc and not args.disable_apr and args.apr_memory_update_iters == 0:
+        args.apr_memory_update_iters = 1
     if args.paper_mnc and not args.disable_mnc:
         args.mnc_strong = True
         args.mnc_stages = max(2, args.mnc_stages)
+        if not args.classic_pirn_mnc1:
+            args.cmpt_replace_mnc1 = True
+    elif args.paper_mnc and args.disable_mnc and not args.disable_cmpt and not args.classic_pirn_mnc1:
+        args.cmpt_replace_mnc1 = True
     if args.disable_shared_proto and args.only_shared_proto:
         raise ValueError('--disable_shared_proto and --only_shared_proto cannot be used together.')
     if args.disable_prototypes:
