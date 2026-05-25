@@ -792,13 +792,13 @@ class CMPTFeatures(Features):
                 raise RuntimeError('only_shared_proto requires shared prototypes.')
             return self.shared_prototypes
         if modal == 'rgb':
-            prototypes = [self.rgb_specific_prototypes]
+            prototypes = [self.rgb_specific_prototypes, self.shared_prototypes]
         elif modal == 'sn':
-            prototypes = [self.sn_specific_prototypes]
+            prototypes = [self.sn_specific_prototypes, self.shared_prototypes]
         elif modal == 'pseudo_sn':
-            prototypes = [self.pseudo_sn_prototypes]
+            prototypes = [self.pseudo_sn_prototypes, self.shared_prototypes]
         elif modal == 'pseudo_rgb':
-            prototypes = [self.pseudo_rgb_prototypes]
+            prototypes = [self.pseudo_rgb_prototypes, self.shared_prototypes]
         else:
             raise ValueError(f'Unsupported prototype bank: {modal}')
         prototypes = [prototype for prototype in prototypes if prototype is not None]
@@ -816,30 +816,6 @@ class CMPTFeatures(Features):
         if modal == 'pseudo_rgb':
             return self.pseudo_rgb_prototypes
         raise ValueError(f'Unsupported prototype bank: {modal}')
-
-    def _mix_shared_reconstruction(self, tokens, reconstruction):
-        if self.shared_prototypes is None or getattr(self.args, 'disable_shared_proto', False):
-            return reconstruction
-        shared_reconstruction, shared_assignment = structured_prototype_assignment(
-            tokens,
-            self.shared_prototypes,
-            temperature=self.args.spa_temperature,
-            sinkhorn_iters=self.args.spa_sinkhorn_iters,
-        )
-        shared_confidence = shared_assignment.max(dim=-1, keepdim=True).values
-        consistency = (F.normalize(tokens, dim=-1) * F.normalize(shared_reconstruction, dim=-1)).sum(dim=-1, keepdim=True)
-        gate = torch.sigmoid(
-            (shared_confidence + consistency - self.args.shared_proto_confidence_threshold) * 5.0
-        )
-        gate = torch.clamp(gate * self.args.shared_proto_gate, 0.0, self.args.shared_proto_gate)
-        return F.normalize((1.0 - gate) * reconstruction + gate * shared_reconstruction, dim=-1)
-
-    def _cmpt_auxiliary_gate(self, real_patch, pseudo_patch):
-        real = F.normalize(real_patch.to(self.device), dim=-1)
-        pseudo = F.normalize(pseudo_patch.to(self.device), dim=-1)
-        consistency = (real * pseudo).sum(dim=-1).mean()
-        gate = torch.sigmoid((consistency - self.args.cmpt_aux_confidence_threshold) * 8.0)
-        return torch.clamp(gate * self.args.cmpt_aux_weight, 0.0, self.args.cmpt_aux_weight).cpu()
 
     def _reconstruct_with_prototypes(self, patch, modal, cross_modal=None):
         tokens = patch.to(self.device)
@@ -864,7 +840,6 @@ class CMPTFeatures(Features):
             temperature=self.args.spa_temperature,
             sinkhorn_iters=self.args.spa_sinkhorn_iters,
         )
-        reconstruction = self._mix_shared_reconstruction(tokens, reconstruction)
 
         if self.args.apr_inference_refine:
             _, assignment = structured_prototype_assignment(
@@ -886,7 +861,6 @@ class CMPTFeatures(Features):
                 temperature=self.args.spa_temperature,
                 sinkhorn_iters=self.args.spa_sinkhorn_iters,
             )
-            reconstruction = self._mix_shared_reconstruction(tokens, reconstruction)
 
         if getattr(self.args, 'disable_mnc', False):
             cross_modal = None
@@ -954,9 +928,8 @@ class CMPTFeatures(Features):
             pseudo_sn_patch = self._pseudo_sn_from_rgb(rgb_patch56)
             s_rgb, smap_rgb = self._reconstruct_with_prototypes(rgb_patch56, 'rgb', cross_modal='pseudo_sn')
             s_sn, smap_sn = self._reconstruct_with_prototypes(pseudo_sn_patch, 'pseudo_sn', cross_modal='rgb')
-            cmpt_gate = self._cmpt_auxiliary_gate(rgb_patch56, pseudo_sn_patch)
-            s = self.args.rgb_s_lambda * s_rgb + cmpt_gate * self.args.cmpt_s_lambda * s_sn
-            s_map = self.args.rgb_smap_lambda * smap_rgb + cmpt_gate * self.args.cmpt_smap_lambda * smap_sn
+            s = self.args.rgb_s_lambda * s_rgb + self.args.cmpt_s_lambda * s_sn
+            s_map = self.args.rgb_smap_lambda * smap_rgb + self.args.cmpt_smap_lambda * smap_sn
             component_maps = {
                 'rgb_error': smap_rgb,
                 'pseudo_sn_error': smap_sn,
@@ -977,9 +950,8 @@ class CMPTFeatures(Features):
             smap_rgb = self._mask_sn_error_map(smap_rgb, sample)
             s_sn = self._score_from_map(smap_sn)
             s_rgb = self._score_from_map(smap_rgb)
-            cmpt_gate = self._cmpt_auxiliary_gate(sn_patch56, pseudo_rgb_patch)
-            s = self.args.sn_s_lambda * s_sn + cmpt_gate * self.args.cmpt_s_lambda * s_rgb
-            s_map = self.args.sn_smap_lambda * smap_sn + cmpt_gate * self.args.cmpt_smap_lambda * smap_rgb
+            s = self.args.sn_s_lambda * s_sn + self.args.cmpt_s_lambda * s_rgb
+            s_map = self.args.sn_smap_lambda * smap_sn + self.args.cmpt_smap_lambda * smap_rgb
             component_maps = {
                 'sn_error': smap_sn,
                 'pseudo_rgb_error': smap_rgb,

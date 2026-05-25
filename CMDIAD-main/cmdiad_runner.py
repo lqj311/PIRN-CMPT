@@ -11,7 +11,7 @@ class CMDIAD():
         self.rgb_size = args.rgb_size
         self.xyz_size = args.xyz_size
         self.gt_size = args.gt_size
-        self.count = args.max_sample
+        self.count = args.few_shot_k if getattr(args, 'few_shot_k', 0) > 0 else args.max_sample
         if args.method_name == 'DINO':
             from feature_extractors import multiple_features
             self.methods = {

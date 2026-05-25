@@ -179,14 +179,6 @@ if __name__ == '__main__':
     parser.add_argument('--cmpt_ot_temperature', default=0.05, type=float)
     parser.add_argument('--cmpt_ot_iters', default=5, type=int)
     parser.add_argument('--cmpt_proto_mlp_weight', default=0.5, type=float)
-    parser.add_argument('--shared_proto_gate', default=0.25, type=float,
-                        help='Maximum contribution of shared prototypes when mixed with modality-specific reconstruction.')
-    parser.add_argument('--shared_proto_confidence_threshold', default=0.35, type=float,
-                        help='Confidence threshold for gated shared prototype reconstruction.')
-    parser.add_argument('--cmpt_aux_weight', default=0.25, type=float,
-                        help='Maximum auxiliary contribution of CMPT pseudo-modality maps in missing-modality scoring.')
-    parser.add_argument('--cmpt_aux_confidence_threshold', default=0.55, type=float,
-                        help='Pseudo-modality reliability threshold for CMPT auxiliary scoring.')
     parser.add_argument('--mnc_cross_weight', default=0.5, type=float)
     parser.add_argument('--mnc_stages', default=2, type=int)
     parser.add_argument('--mnc_strong', default=False, action='store_true')

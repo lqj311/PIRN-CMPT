@@ -51,6 +51,47 @@ def _format_missing_dataset_message(class_name, split_root, rgb_dir, xyz_dir):
     )
 
 
+def _path_stem(path):
+    return Path(path).stem
+
+
+def _stable_fewshot_indices(total, k, seed, class_name):
+    if k <= 0 or k >= total:
+        return list(range(total))
+    offset = sum(ord(c) for c in class_name)
+    rng = np.random.default_rng(seed + offset)
+    return sorted(rng.choice(total, size=k, replace=False).tolist())
+
+
+def _save_fewshot_manifest(dataset, indices, args, split):
+    if not getattr(args, 'save_fewshot_list', False):
+        return
+    out_dir = Path(args.fewshot_list_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f'{dataset.cls}_{split}_k{args.few_shot_k}_seed{args.shot_seed}.txt'
+    with open(out_path, 'w', encoding='utf-8') as fp:
+        for idx in indices:
+            item = dataset.img_paths[idx]
+            if isinstance(item, tuple):
+                fp.write('\t'.join(str(p) for p in item) + '\n')
+            else:
+                fp.write(str(item) + '\n')
+
+
+def apply_fewshot_subset(dataset, args, split):
+    k = getattr(args, 'few_shot_k', 0)
+    if split not in ['train', 'train_validation'] or k <= 0:
+        return dataset
+    total = len(dataset.img_paths)
+    indices = _stable_fewshot_indices(total, k, getattr(args, 'shot_seed', 0), dataset.cls)
+    _save_fewshot_manifest(dataset, indices, args, split)
+    dataset.img_paths = [dataset.img_paths[i] for i in indices]
+    dataset.labels = [dataset.labels[i] for i in indices]
+    print(f'[FewShot] {dataset.cls} {split}: selected {len(indices)}/{total} normal training samples '
+          f'(K={k}, seed={getattr(args, "shot_seed", 0)}).')
+    return dataset
+
+
 class BaseAnomalyDetectionDataset(Dataset):
     def __init__(self, split, class_name, rgb_size, xyz_size, gt_size, dataset_path, img_process_method):
         self.IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -266,6 +307,100 @@ class TestDataset(BaseAnomalyDetectionDataset):
         return (img, resized_organized_pc, resized_depth_map_3channel), gt[:1], label, rgb_path
 
 
+class MissingModalityTestDataset(TestDataset):
+    def __init__(self, class_name, rgb_size, xyz_size, gt_size, dataset_path, img_process_method, main_modality):
+        self.main_modality = main_modality
+        super().__init__(
+            class_name=class_name,
+            rgb_size=rgb_size,
+            xyz_size=xyz_size,
+            gt_size=gt_size,
+            dataset_path=dataset_path,
+            img_process_method=img_process_method,
+        )
+
+    def load_dataset(self):
+        img_tot_paths = []
+        gt_tot_paths = []
+        tot_labels = []
+        defect_types = os.listdir(self.img_path)
+        main_modality = self.main_modality
+
+        for defect_type in defect_types:
+            defect_root = Path(self.img_path, defect_type)
+            rgb_paths = sorted(defect_root.joinpath('rgb').glob('*.png'))
+            tiff_paths = sorted(defect_root.joinpath('xyz').glob('*.tiff'))
+            rgb_by_stem = {_path_stem(path): path for path in rgb_paths}
+            tiff_by_stem = {_path_stem(path): path for path in tiff_paths}
+            if main_modality == 'rgb':
+                stems = sorted(rgb_by_stem)
+            elif main_modality == 'sn':
+                stems = sorted(tiff_by_stem)
+            else:
+                stems = sorted(set(rgb_by_stem) & set(tiff_by_stem))
+
+            if defect_type == 'good':
+                gt_paths = [0] * len(stems)
+                labels = [0] * len(stems)
+            else:
+                gt_by_stem = {_path_stem(path): path for path in sorted(defect_root.joinpath('gt').glob('*.png'))}
+                gt_paths = [gt_by_stem.get(stem, 0) for stem in stems]
+                labels = [1] * len(stems)
+
+            for stem, gt_path, label in zip(stems, gt_paths, labels):
+                rgb_path = rgb_by_stem.get(stem)
+                tiff_path = tiff_by_stem.get(stem)
+                if main_modality == 'rgb' and rgb_path is None:
+                    continue
+                if main_modality == 'sn' and tiff_path is None:
+                    continue
+                if main_modality == '' and (rgb_path is None or tiff_path is None):
+                    continue
+                img_tot_paths.append((rgb_path, tiff_path))
+                gt_tot_paths.append(gt_path)
+                tot_labels.append(label)
+
+        if not img_tot_paths:
+            raise FileNotFoundError(
+                f'No test samples found for class `{self.cls}` at `{self.img_path}` with '
+                f'main_modality `{main_modality}`.'
+            )
+        return img_tot_paths, gt_tot_paths, tot_labels
+
+    def __getitem__(self, idx):
+        img_path, gt, label = self.img_paths[idx], self.gt_paths[idx], self.labels[idx]
+        rgb_path = img_path[0]
+        tiff_path = img_path[1]
+
+        if rgb_path is None:
+            img = torch.zeros(3, self.rgb_size, self.rgb_size)
+        else:
+            img = self.rgb_transform(Image.open(rgb_path).convert('RGB'))
+
+        if tiff_path is None:
+            resized_organized_pc = torch.zeros(3, self.xyz_size, self.xyz_size).float()
+            resized_depth_map_3channel = torch.zeros(3, self.xyz_size, self.xyz_size).float()
+        else:
+            organized_pc = read_tiff_organized_pc(tiff_path)
+            depth_map_3channel = np.repeat(organized_pc_to_depth_map(organized_pc)[:, :, np.newaxis], 3, axis=2)
+            resized_depth_map_3channel = resize_organized_pc(depth_map_3channel)
+            resized_organized_pc = resize_organized_pc(
+                organized_pc,
+                target_height=self.xyz_size,
+                target_width=self.xyz_size,
+            )
+            resized_organized_pc = resized_organized_pc.clone().detach().float()
+
+        if gt == 0:
+            gt = torch.zeros([1, self.gt_size, self.gt_size])
+        else:
+            gt = self.gt_transform(Image.open(gt).convert('L'))
+            gt = torch.where(gt > 0.5, 1., .0)
+
+        ref_path = str(rgb_path if rgb_path is not None else tiff_path)
+        return (img, resized_organized_pc, resized_depth_map_3channel), gt[:1], label, ref_path
+
+
 class PreTrainTensorDataset(Dataset):
     #  patch = torch.cat([xyz_patch, rgb_patch_resize], dim=1)  # 3136 768+1152
     def __init__(self, root_path):
@@ -391,10 +526,26 @@ def get_data_loader(split, class_name, rgb_size, xyz_size, gt_size, args):
         dataset = TrainValidationDataset(class_name=class_name, rgb_size=rgb_size, xyz_size=xyz_size, gt_size=gt_size,
                                dataset_path=args.dataset_path, img_process_method=args.img_process_method)
     elif split in ['test']:
-        dataset = TestDataset(class_name=class_name, rgb_size=rgb_size, xyz_size=xyz_size, gt_size=gt_size,
-                               dataset_path=args.dataset_path, img_process_method=args.img_process_method)
+        if (
+            getattr(args, 'allow_true_missing_modality', False)
+            and getattr(args, 'main_modality', '') in ['rgb', 'sn']
+        ):
+            dataset = MissingModalityTestDataset(
+                class_name=class_name,
+                rgb_size=rgb_size,
+                xyz_size=xyz_size,
+                gt_size=gt_size,
+                dataset_path=args.dataset_path,
+                img_process_method=args.img_process_method,
+                main_modality=args.main_modality,
+            )
+        else:
+            dataset = TestDataset(class_name=class_name, rgb_size=rgb_size, xyz_size=xyz_size, gt_size=gt_size,
+                                  dataset_path=args.dataset_path, img_process_method=args.img_process_method)
     else:
         raise ValueError
+
+    dataset = apply_fewshot_subset(dataset, args, split)
 
     data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False, num_workers=6, drop_last=False,
                              prefetch_factor=6, pin_memory=True)
