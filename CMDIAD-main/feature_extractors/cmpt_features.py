@@ -325,6 +325,7 @@ class CMPTFeatures(Features):
         self.pseudo_rgb_prototypes = None
         self.prototype_ready = False
         self._cmpt_reliability_cache = {}
+        self._cmpt_full_calibration_cache = None
 
         self.patch_rgb56_train = []
         self.patch_sn56_train = []
@@ -524,7 +525,6 @@ class CMPTFeatures(Features):
         rgb = rgb.to(self.device)
         sn = sn.to(self.device)
         optimizer = torch.optim.AdamW(self.cmpt.parameters(), lr=self.args.cmpt_lr, weight_decay=self.args.cmpt_weight_decay)
-        loss_fn = nn.SmoothL1Loss()
 
         self.cmpt.train()
         for _ in range(self.args.cmpt_epochs):
@@ -534,7 +534,7 @@ class CMPTFeatures(Features):
                 rgb_batch = rgb[idx].unsqueeze(0)
                 sn_batch = sn[idx].unsqueeze(0)
                 pseudo_sn, pseudo_rgb = self.cmpt(rgb_batch, sn_batch, out_type='train')
-                loss = loss_fn(pseudo_sn, sn_batch) + loss_fn(pseudo_rgb, rgb_batch)
+                loss = self._cmpt_training_loss(rgb_batch, sn_batch, pseudo_rgb, pseudo_sn)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -547,6 +547,55 @@ class CMPTFeatures(Features):
             torch.save({'model': self.cmpt.state_dict()}, save_path)
         self.cmpt.eval()
         self.cmpt_trained = True
+
+    @staticmethod
+    def _mean_cosine_loss(prediction, target):
+        prediction = F.normalize(prediction, dim=-1)
+        target = F.normalize(target, dim=-1)
+        return 1.0 - (prediction * target).sum(dim=-1).mean()
+
+    def _relation_consistency_loss(self, prediction, target):
+        max_tokens = getattr(self.args, 'cmpt_relation_tokens', 512)
+        token_count = prediction.shape[1]
+        if max_tokens <= 1 or token_count <= 1:
+            return prediction.new_tensor(0.0)
+        if token_count > max_tokens:
+            idx = torch.linspace(0, token_count - 1, steps=max_tokens, device=prediction.device).long()
+            prediction = prediction[:, idx]
+            target = target[:, idx]
+        prediction = F.normalize(prediction.squeeze(0), dim=-1)
+        target = F.normalize(target.squeeze(0), dim=-1)
+        prediction_relation = prediction @ prediction.t()
+        target_relation = target @ target.t()
+        return F.smooth_l1_loss(prediction_relation, target_relation)
+
+    def _cmpt_training_loss(self, rgb_batch, sn_batch, pseudo_rgb, pseudo_sn):
+        loss = F.smooth_l1_loss(pseudo_sn, sn_batch) + F.smooth_l1_loss(pseudo_rgb, rgb_batch)
+
+        cosine_weight = getattr(self.args, 'cmpt_cosine_loss_weight', 0.0)
+        if cosine_weight > 0:
+            loss = loss + cosine_weight * (
+                self._mean_cosine_loss(pseudo_sn, sn_batch)
+                + self._mean_cosine_loss(pseudo_rgb, rgb_batch)
+            )
+
+        cycle_weight = getattr(self.args, 'cmpt_cycle_loss_weight', 0.0)
+        if cycle_weight > 0:
+            cycle_rgb = self.cmpt(sn_feature=pseudo_sn, out_type='rgb')
+            cycle_sn = self.cmpt(rgb_feature=pseudo_rgb, out_type='sn')
+            loss = loss + cycle_weight * (
+                F.smooth_l1_loss(cycle_rgb, rgb_batch)
+                + F.smooth_l1_loss(cycle_sn, sn_batch)
+            )
+
+        relation_weight = getattr(self.args, 'cmpt_relation_loss_weight', 0.0)
+        if relation_weight > 0:
+            loss = loss + relation_weight * (
+                self._relation_consistency_loss(pseudo_sn, sn_batch)
+                + self._relation_consistency_loss(pseudo_rgb, rgb_batch)
+            )
+
+        return loss
 
     def _save_learnable_mnc(self):
         mnc_save_path = self._format_cmpt_path(self.args.mnc_save_path)
@@ -972,7 +1021,7 @@ class CMPTFeatures(Features):
                 return self.cmpt(rgb_feature=patch.unsqueeze(0).to(self.device), out_type='sn').squeeze(0).cpu()
         raise ValueError(f'Unsupported CMPT cycle target: {out_type}')
 
-    def _cmpt_reliability_gate(self, modal):
+    def _cmpt_reliability_score(self, modal):
         if modal in self._cmpt_reliability_cache:
             return self._cmpt_reliability_cache[modal]
         rgb_train, sn_train = self._paired_train_tokens(getattr(self.args, 'cmpt_gate_max_tokens', 20000))
@@ -982,17 +1031,57 @@ class CMPTFeatures(Features):
             if modal == 'rgb':
                 pseudo_sn = self.cmpt(rgb_feature=rgb_train.unsqueeze(0), out_type='sn').squeeze(0)
                 cycle_rgb = self.cmpt(sn_feature=pseudo_sn.unsqueeze(0), out_type='rgb').squeeze(0)
-                error = torch.linalg.norm(F.normalize(rgb_train, dim=-1) - F.normalize(cycle_rgb, dim=-1), dim=-1).mean()
+                consistency = (F.normalize(rgb_train, dim=-1) * F.normalize(cycle_rgb, dim=-1)).sum(dim=-1).mean()
             elif modal == 'sn':
                 pseudo_rgb = self.cmpt(sn_feature=sn_train.unsqueeze(0), out_type='rgb').squeeze(0)
                 cycle_sn = self.cmpt(rgb_feature=pseudo_rgb.unsqueeze(0), out_type='sn').squeeze(0)
-                error = torch.linalg.norm(F.normalize(sn_train, dim=-1) - F.normalize(cycle_sn, dim=-1), dim=-1).mean()
+                consistency = (F.normalize(sn_train, dim=-1) * F.normalize(cycle_sn, dim=-1)).sum(dim=-1).mean()
             else:
                 raise ValueError(f'Unsupported CMPT reliability modal: {modal}')
-        gate = torch.sigmoid((self.args.cmpt_aux_confidence_threshold - error) * 8.0)
-        gate = torch.clamp(gate * self.args.cmpt_aux_weight, 0.0, self.args.cmpt_aux_weight).cpu()
-        self._cmpt_reliability_cache[modal] = gate
-        return gate
+        score = torch.sigmoid((consistency - self.args.cmpt_aux_confidence_threshold) * 8.0)
+        score = torch.clamp(score, 0.0, 1.0).cpu()
+        self._cmpt_reliability_cache[modal] = score
+        return score
+
+    def _cmpt_reliability_gate(self, modal):
+        score = self._cmpt_reliability_score(modal)
+        return torch.clamp(score * self.args.cmpt_aux_weight, 0.0, self.args.cmpt_aux_weight)
+
+    def _cmpt_full_consistency_threshold(self):
+        if self._cmpt_full_calibration_cache is not None:
+            return self._cmpt_full_calibration_cache
+        rgb_train, sn_train = self._paired_train_tokens(getattr(self.args, 'cmpt_gate_max_tokens', 20000))
+        rgb_train = rgb_train.to(self.device)
+        sn_train = sn_train.to(self.device)
+        with torch.no_grad():
+            pseudo_sn = self.cmpt(rgb_feature=rgb_train.unsqueeze(0), out_type='sn').squeeze(0)
+            pseudo_rgb = self.cmpt(sn_feature=sn_train.unsqueeze(0), out_type='rgb').squeeze(0)
+            rgb_to_sn_error = torch.linalg.norm(
+                F.normalize(sn_train, dim=-1) - F.normalize(pseudo_sn, dim=-1),
+                dim=-1,
+            )
+            sn_to_rgb_error = torch.linalg.norm(
+                F.normalize(rgb_train, dim=-1) - F.normalize(pseudo_rgb, dim=-1),
+                dim=-1,
+            )
+            normal_error = 0.5 * (rgb_to_sn_error + sn_to_rgb_error)
+            mean = normal_error.mean()
+            std = normal_error.std(unbiased=False)
+            threshold = mean + self.args.cmpt_full_calibration_std * std
+        self._cmpt_full_calibration_cache = (
+            threshold.detach().cpu(),
+            std.detach().cpu().clamp_min(1e-6),
+        )
+        return self._cmpt_full_calibration_cache
+
+    def _calibrate_cmpt_full_map(self, cmpt_map):
+        if self.args.cmpt_full_calibration_std < 0:
+            return cmpt_map
+        threshold, std = self._cmpt_full_consistency_threshold()
+        threshold = threshold.to(cmpt_map.device, dtype=cmpt_map.dtype)
+        std = std.to(cmpt_map.device, dtype=cmpt_map.dtype)
+        residual = torch.relu(cmpt_map - threshold) / (std + 1e-6)
+        return residual * self.args.cmpt_full_map_gain
 
     def _cycle_error_map(self, real_patch, cycle_patch):
         s_map = reconstruction_error_map(
@@ -1006,9 +1095,9 @@ class CMPTFeatures(Features):
     def _cmpt_full_consistency_map(self, rgb_patch, sn_patch, sample):
         if getattr(self.args, 'disable_cmpt', False) or getattr(self.args, 'disable_pseudo_proto', False):
             return None, torch.tensor(0.0)
-        rgb_gate = self._cmpt_reliability_gate('rgb')
-        sn_gate = self._cmpt_reliability_gate('sn')
-        gate = torch.minimum(rgb_gate, sn_gate) * self.args.cmpt_full_consistency_weight
+        rgb_score = self._cmpt_reliability_score('rgb')
+        sn_score = self._cmpt_reliability_score('sn')
+        gate = torch.minimum(rgb_score, sn_score) * self.args.cmpt_full_consistency_weight
         if float(gate) <= 1e-8:
             return None, gate
         pseudo_sn = self._pseudo_sn_from_rgb(rgb_patch)
@@ -1028,6 +1117,7 @@ class CMPTFeatures(Features):
         rgb_to_sn_map = self._mask_sn_error_map(self.blur(rgb_to_sn_map), sample)
         sn_to_rgb_map = self.blur(sn_to_rgb_map)
         cmpt_map = 0.5 * (rgb_to_sn_map + sn_to_rgb_map)
+        cmpt_map = self._calibrate_cmpt_full_map(cmpt_map)
         return cmpt_map, gate
 
     @staticmethod

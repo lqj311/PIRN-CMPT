@@ -165,6 +165,14 @@ if __name__ == '__main__':
     parser.add_argument('--cmpt_weight_decay', default=1e-4, type=float)
     parser.add_argument('--cmpt_hidden_ratio', default=2.5, type=float)
     parser.add_argument('--cmpt_mlp_depth', default=2, type=int)
+    parser.add_argument('--cmpt_cycle_loss_weight', default=0.25, type=float,
+                        help='Cycle-consistency loss weight for CMPT RGB->SN->RGB and SN->RGB->SN training.')
+    parser.add_argument('--cmpt_cosine_loss_weight', default=0.1, type=float,
+                        help='Cosine alignment loss weight for paired CMPT feature transfer.')
+    parser.add_argument('--cmpt_relation_loss_weight', default=0.05, type=float,
+                        help='Relational consistency loss weight for preserving normal-token geometry across modalities.')
+    parser.add_argument('--cmpt_relation_tokens', default=512, type=int,
+                        help='Maximum tokens per batch used by CMPT relational consistency loss.')
     parser.add_argument('--num_rgb_prototypes', default=64, type=int)
     parser.add_argument('--num_sn_prototypes', default=64, type=int)
     parser.add_argument('--num_shared_prototypes', default=64, type=int)
@@ -190,11 +198,11 @@ if __name__ == '__main__':
                         help='Maximum contribution of shared prototypes when mixed with modality-specific reconstruction.')
     parser.add_argument('--shared_proto_confidence_threshold', default=0.35, type=float,
                         help='Confidence threshold for gated shared prototype reconstruction.')
-    parser.add_argument('--cmpt_aux_weight', default=0.25, type=float,
+    parser.add_argument('--cmpt_aux_weight', default=0.35, type=float,
                         help='Maximum auxiliary contribution of CMPT pseudo-modality maps in missing-modality scoring.')
-    parser.add_argument('--cmpt_aux_confidence_threshold', default=0.55, type=float,
+    parser.add_argument('--cmpt_aux_confidence_threshold', default=0.50, type=float,
                         help='Pseudo-modality reliability threshold for CMPT auxiliary scoring.')
-    parser.add_argument('--cmpt_aux_mode', default='cycle', type=str, choices=['pseudo_error', 'cycle', 'both'],
+    parser.add_argument('--cmpt_aux_mode', default='both', type=str, choices=['pseudo_error', 'cycle', 'both'],
                         help='How CMPT contributes under missing modality.')
     parser.add_argument('--cmpt_gate_max_tokens', default=20000, type=int,
                         help='Maximum normal training tokens used to estimate CMPT auxiliary reliability.')
@@ -202,17 +210,21 @@ if __name__ == '__main__':
                         help='How real and CMPT auxiliary error maps are fused under missing modality.')
     parser.add_argument('--cmpt_consensus_power', default=1.5, type=float,
                         help='Power applied to normalized real-modality map for consensus CMPT fusion.')
-    parser.add_argument('--cmpt_full_consistency_weight', default=0.15, type=float,
+    parser.add_argument('--cmpt_full_consistency_weight', default=0.25, type=float,
                         help='Maximum contribution of RGB<->SN CMPT consistency maps when both modalities are available.')
+    parser.add_argument('--cmpt_full_calibration_std', default=-1.0, type=float,
+                        help='Normal-training std multiplier used to threshold full-modality CMPT consistency maps; negative disables calibration.')
+    parser.add_argument('--cmpt_full_map_gain', default=1.0, type=float,
+                        help='Gain applied to normal-calibrated full-modality CMPT consistency residual maps.')
     parser.add_argument('--cmpt_replace_mnc1', default=False, action='store_true',
                         help='Use CMPT as the first-stage cross-modal normality communication block.')
     parser.add_argument('--classic_pirn_mnc1', default=False, action='store_true',
                         help='Keep the previous PIRN-style MNC stage1 when --paper_mnc is used.')
-    parser.add_argument('--cmpt_nc_weight', default=0.1, type=float,
+    parser.add_argument('--cmpt_nc_weight', default=0.20, type=float,
                         help='Maximum gate weight of CMPT normality communication when replacing MNC stage1.')
-    parser.add_argument('--cmpt_nc_confidence_threshold', default=0.6, type=float,
+    parser.add_argument('--cmpt_nc_confidence_threshold', default=0.55, type=float,
                         help='Confidence threshold for CMPT normality communication.')
-    parser.add_argument('--cmpt_nc_safe_margin', default=0.0, type=float,
+    parser.add_argument('--cmpt_nc_safe_margin', default=0.02, type=float,
                         help='Allow CMPT-NC candidate reconstruction only when normal-prototype compatibility does not decrease beyond this margin.')
     parser.add_argument('--branch_fusion_mode', default='consensus', type=str, choices=['sum', 'mean', 'consensus', 'max'],
                         help='Fusion strategy for RGB and SN maps when both modalities are available.')

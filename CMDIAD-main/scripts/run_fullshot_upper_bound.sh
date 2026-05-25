@@ -32,6 +32,18 @@ for SEED in $SEEDS; do
     --max_sample 500 \
     --cmpt_epochs "$CMPT_EPOCHS" \
     --cmpt_lr 1e-4 \
+    --cmpt_cycle_loss_weight 0.25 \
+    --cmpt_cosine_loss_weight 0.1 \
+    --cmpt_relation_loss_weight 0.05 \
+    --cmpt_aux_weight 0.35 \
+    --cmpt_aux_confidence_threshold 0.50 \
+    --cmpt_aux_mode both \
+    --cmpt_full_consistency_weight 0.25 \
+    --cmpt_full_calibration_std -1.0 \
+    --cmpt_full_map_gain 1.0 \
+    --cmpt_nc_weight 0.20 \
+    --cmpt_nc_confidence_threshold 0.55 \
+    --cmpt_nc_safe_margin 0.02 \
     --num_rgb_prototypes "$PROTOTYPES" \
     --num_sn_prototypes "$PROTOTYPES" \
     --num_shared_prototypes "$PROTOTYPES" \
